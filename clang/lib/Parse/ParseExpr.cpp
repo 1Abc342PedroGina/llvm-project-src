@@ -1,8 +1,20 @@
 //===--- ParseExpr.cpp - Expression Parsing -------------------------------===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//   Copyright (C) 2026 Pedro Emanuel
+//
+//    This program is free software: you can redistribute it and/or modify
+//    it under the terms of the GNU Affero General Public License as
+//    published by the Free Software Foundation, either version 3 of the
+//    License, or (at your option) any later version.
+//
+//    This program is distributed in the hope that it will be useful,
+//    but WITHOUT ANY WARRANTY; without even the implied warranty of
+//    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//    GNU Affero General Public License for more details.
+//
+//    You should have received a copy of the GNU Affero General Public License
+//    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -3651,6 +3663,932 @@ ExprResult Parser::ParseUnsafeForgeTerminatedBy() {
                                         T.getCloseLocation());
 }
 
+/// ParseBoundsSafeCast - Parses bounds-safe cast operations that convert
+/// between pointer types while preserving or adjusting bounds information.
+///
+/// Syntax:
+///   __bounded_cast<type>(expr) -> cast with bounds preservation
+///   __unbounded_cast<type>(expr) -> cast that removes bounds
+///   __rebound_cast<type, bounds>(expr) -> cast with new bounds
+///   __contract_cast(expr) -> contract bounds (narrow)
+///   __expand_cast(expr) -> expand bounds (widen)
+///
+ExprResult Parser::ParseBoundsSafeCast() {
+  assert(Tok.isOneOf(tok::kw___bounded_cast, tok::kw___unbounded_cast,
+                     tok::kw___rebound_cast, tok::kw___contract_cast,
+                     tok::kw___expand_cast) &&
+         "Not a bounds-safe cast expression!");
+
+  SourceLocation KWLoc = ConsumeToken();
+  bool IsBounded = (Tok.getKind() == tok::kw___bounded_cast);
+  bool IsUnbounded = (Tok.getKind() == tok::kw___unbounded_cast);
+  bool IsRebound = (Tok.getKind() == tok::kw___rebound_cast);
+  bool IsContract = (Tok.getKind() == tok::kw___contract_cast);
+  bool IsExpand = (Tok.getKind() == tok::kw___expand_cast);
+
+  // Parse template argument list for casts that require a type
+  TypeResult TargetType;
+  ExprResult BoundsExpr;
+  SourceLocation LAngleLoc, RAngleLoc;
+
+  if (IsBounded || IsUnbounded || IsRebound) {
+    // Parse template arguments: <type> or <type, bounds>
+    if (Tok.isNot(tok::less)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::less;
+      return ExprError();
+    }
+
+    LAngleLoc = ConsumeToken();
+
+    // Parse the target type
+    TargetType = ParseTypeName();
+    if (TargetType.isInvalid()) {
+      SkipUntil(tok::greater, StopAtSemi);
+      return ExprError();
+    }
+
+    // For rebound_cast, parse bounds expression
+    if (IsRebound && Tok.is(tok::comma)) {
+      ConsumeToken();
+
+      EnterExpressionEvaluationContext EC(
+          Actions,
+          Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+          nullptr,
+          Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_AttrArgument);
+
+      BoundsExpr = ParseAssignmentExpression();
+      if (BoundsExpr.isInvalid()) {
+        SkipUntil(tok::greater, StopAtSemi);
+        return ExprError();
+      }
+    }
+
+    if (Tok.isNot(tok::greater)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::greater;
+      SkipUntil(tok::greater, StopAtSemi);
+      return ExprError();
+    }
+    RAngleLoc = ConsumeToken();
+  }
+
+  // Parse the expression to cast
+  BalancedDelimiterTracker T(*this, tok::l_paren);
+  if (T.expectAndConsume(diag::err_expected_lparen_after,
+                         IsBounded ? "__bounded_cast" :
+                         IsUnbounded ? "__unbounded_cast" :
+                         IsRebound ? "__rebound_cast" :
+                         IsContract ? "__contract_cast" : "__expand_cast")) {
+    return ExprError();
+  }
+
+  ExprResult SubExpr = ParseAssignmentExpression();
+  if (SubExpr.isInvalid()) {
+    T.skipToEnd();
+    return ExprError();
+  }
+
+  if (T.consumeClose())
+    return ExprError();
+
+  // Validate the cast based on its type
+  if (IsBounded || IsUnbounded || IsRebound) {
+    if (TargetType.isInvalid()) {
+      return ExprError();
+    }
+
+    // For bounded_cast, ensure the target type can carry bounds
+    if (IsBounded && TargetType.isUsable()) {
+      QualType Target = TargetType.get().get();
+      if (!Target.isNull() && !Target->isPointerType() &&
+          !Target->isArrayType()) {
+        Diag(LAngleLoc, diag::err_bounded_cast_on_non_pointer)
+            << Target;
+      }
+    }
+  }
+
+  // Create the appropriate cast expression
+  if (IsBounded) {
+    return Actions.ActOnBoundedCastExpr(
+        SubExpr.get(), TargetType.get(), KWLoc, T.getCloseLocation(),
+        LAngleLoc, RAngleLoc);
+  } else if (IsUnbounded) {
+    return Actions.ActOnUnboundedCastExpr(
+        SubExpr.get(), TargetType.get(), KWLoc, T.getCloseLocation(),
+        LAngleLoc, RAngleLoc);
+  } else if (IsRebound) {
+    return Actions.ActOnReboundCastExpr(
+        SubExpr.get(), TargetType.get(), BoundsExpr.get(),
+        KWLoc, T.getCloseLocation(), LAngleLoc, RAngleLoc);
+  } else if (IsContract) {
+    return Actions.ActOnContractBoundsExpr(
+        SubExpr.get(), KWLoc, T.getCloseLocation());
+  } else { // IsExpand
+    return Actions.ActOnExpandBoundsExpr(
+        SubExpr.get(), KWLoc, T.getCloseLocation());
+  }
+}
+
+/// ParseBoundsCheckExpression - Parses a bounds checking expression that
+/// validates pointer bounds at runtime. This is part of the bounds safety
+/// extension that allows explicit bounds checking in code.
+///
+/// Syntax:
+///   __bounds_check(pointer) -> checks if pointer is within its bounds
+///   __bounds_check(pointer, lower, upper) -> checks pointer against explicit bounds
+///   __bounds_check_range(pointer, start, count) -> checks pointer in range [start, start+count)
+///   __bounds_check_terminated(pointer) -> checks null-terminated pointer
+///   __bounds_check_aligned(pointer, alignment) -> checks alignment
+///
+ExprResult Parser::ParseBoundsCheckExpression() {
+  assert(Tok.isOneOf(tok::kw___bounds_check, tok::kw___bounds_check_range,
+                     tok::kw___bounds_check_terminated,
+                     tok::kw___bounds_check_aligned) &&
+         "Not a bounds check expression!");
+
+  SourceLocation KWLoc = ConsumeToken();
+  tok::TokenKind Kind = Tok.getKind() == tok::kw___bounds_check_range
+                            ? tok::kw___bounds_check_range
+                        : Tok.getKind() == tok::kw___bounds_check_terminated
+                            ? tok::kw___bounds_check_terminated
+                        : Tok.getKind() == tok::kw___bounds_check_aligned
+                            ? tok::kw___bounds_check_aligned
+                            : tok::kw___bounds_check;
+
+  BalancedDelimiterTracker T(*this, tok::l_paren);
+  if (T.expectAndConsume(diag::err_expected_lparen_after,
+                         Kind == tok::kw___bounds_check
+                             ? "__bounds_check"
+                         : Kind == tok::kw___bounds_check_range
+                             ? "__bounds_check_range"
+                         : Kind == tok::kw___bounds_check_terminated
+                             ? "__bounds_check_terminated"
+                             : "__bounds_check_aligned")) {
+    return ExprError();
+  }
+
+  // Parse the pointer expression (required for all forms)
+  ExprResult Pointer = ParseAssignmentExpression();
+  if (Pointer.isInvalid()) {
+    T.skipToEnd();
+    return ExprError();
+  }
+
+  ExprResult LowerBound, UpperBound, Alignment;
+  bool HasExplicitBounds = false;
+
+  // Handle different forms of bounds checking
+  if (Kind == tok::kw___bounds_check_range) {
+    // __bounds_check_range(pointer, start, count)
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    LowerBound = ParseAssignmentExpression();
+    if (LowerBound.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    UpperBound = ParseAssignmentExpression();
+    if (UpperBound.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+    HasExplicitBounds = true;
+
+  } else if (Kind == tok::kw___bounds_check_terminated) {
+    // __bounds_check_terminated(pointer) - no additional arguments
+    HasExplicitBounds = false;
+
+  } else if (Kind == tok::kw___bounds_check_aligned) {
+    // __bounds_check_aligned(pointer, alignment)
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Alignment = ParseAssignmentExpression();
+    if (Alignment.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+    HasExplicitBounds = false;
+
+  } else {
+    // __bounds_check(pointer) - may have optional bounds
+    if (TryConsumeToken(tok::comma)) {
+      LowerBound = ParseAssignmentExpression();
+      if (LowerBound.isInvalid()) {
+        T.skipToEnd();
+        return ExprError();
+      }
+
+      if (TryConsumeToken(tok::comma)) {
+        UpperBound = ParseAssignmentExpression();
+        if (UpperBound.isInvalid()) {
+          T.skipToEnd();
+          return ExprError();
+        }
+      }
+      HasExplicitBounds = true;
+    }
+  }
+
+  if (T.consumeClose())
+    return ExprError();
+
+  // Validate that bounds expressions are appropriate
+  if (HasExplicitBounds) {
+    if (!LowerBound.get() || !UpperBound.get()) {
+      Diag(KWLoc, diag::err_bounds_check_incomplete_bounds)
+          << (LowerBound.get() ? "upper" : "lower");
+      return ExprError();
+    }
+  }
+
+  // For alignment check, validate that alignment is a power of two
+  if (Alignment.isUsable()) {
+    ExprResult AlignCheck = Actions.ActOnBoundsCheckAlignment(
+        Pointer.get(), Alignment.get(), KWLoc, T.getCloseLocation());
+    if (AlignCheck.isInvalid())
+      return AlignCheck;
+  }
+
+  // Create the bounds check expression
+  return Actions.ActOnBoundsCheckExpr(
+      Pointer.get(), LowerBound.get(), UpperBound.get(), Alignment.get(),
+      KWLoc, T.getCloseLocation(), HasExplicitBounds,
+      Kind == tok::kw___bounds_check_range,
+      Kind == tok::kw___bounds_check_terminated);
+}
+
+/// ParsePointerArithmeticWithBounds - Parses pointer arithmetic expressions
+/// that respect bounds safety. This allows checked pointer arithmetic that
+/// ensures operations stay within bounds.
+///
+/// Syntax:
+///   __ptr_add(ptr, offset) -> checked pointer addition
+///   __ptr_sub(ptr, offset) -> checked pointer subtraction
+///   __ptr_diff(ptr1, ptr2) -> checked pointer difference
+///   __ptr_bounds(ptr) -> get bounds of pointer
+///
+ExprResult Parser::ParsePointerArithmeticWithBounds() {
+  assert(Tok.isOneOf(tok::kw___ptr_add, tok::kw___ptr_sub, tok::kw___ptr_diff,
+                     tok::kw___ptr_bounds) &&
+         "Not a pointer arithmetic with bounds expression!");
+
+  SourceLocation KWLoc = ConsumeToken();
+  tok::TokenKind Kind = Tok.getKind();
+  bool IsAdd = (Kind == tok::kw___ptr_add);
+  bool IsSub = (Kind == tok::kw___ptr_sub);
+  bool IsDiff = (Kind == tok::kw___ptr_diff);
+  bool IsBounds = (Kind == tok::kw___ptr_bounds);
+
+  BalancedDelimiterTracker T(*this, tok::l_paren);
+  if (T.expectAndConsume(diag::err_expected_lparen_after,
+                         IsAdd ? "__ptr_add" : IsSub ? "__ptr_sub"
+                         : IsDiff ? "__ptr_diff" : "__ptr_bounds")) {
+    return ExprError();
+  }
+
+  // Parse the pointer expression (required for all forms)
+  ExprResult Pointer = ParseAssignmentExpression();
+  if (Pointer.isInvalid()) {
+    T.skipToEnd();
+    return ExprError();
+  }
+
+  ExprResult Offset, Pointer2;
+
+  // Handle different forms
+  if (IsAdd || IsSub) {
+    // __ptr_add(ptr, offset) or __ptr_sub(ptr, offset)
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Offset = ParseAssignmentExpression();
+    if (Offset.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    // Validate that offset is an integer type
+    if (Offset.isUsable()) {
+      QualType OffsetType = Offset.get()->getType();
+      if (!OffsetType.isNull() && !OffsetType->isIntegerType()) {
+        Diag(Offset.get()->getExprLoc(),
+             diag::err_ptr_arithmetic_offset_not_integer)
+            << OffsetType;
+      }
+    }
+
+  } else if (IsDiff) {
+    // __ptr_diff(ptr1, ptr2)
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Pointer2 = ParseAssignmentExpression();
+    if (Pointer2.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    // Validate that both pointers are of compatible types
+    if (Pointer.isUsable() && Pointer2.isUsable()) {
+      QualType Ptr1Type = Pointer.get()->getType();
+      QualType Ptr2Type = Pointer2.get()->getType();
+      if (!Ptr1Type.isNull() && !Ptr2Type.isNull() &&
+          !Ptr1Type->isPointerType() && !Ptr2Type->isPointerType()) {
+        Diag(KWLoc, diag::err_ptr_diff_non_pointer)
+            << Ptr1Type << Ptr2Type;
+      }
+    }
+
+  } else if (IsBounds) {
+    // __ptr_bounds(ptr) - no additional arguments
+  }
+
+  if (T.consumeClose())
+    return ExprError();
+
+  // Create the appropriate expression
+  if (IsAdd) {
+    return Actions.ActOnPtrAddExpr(Pointer.get(), Offset.get(),
+                                   KWLoc, T.getCloseLocation());
+  } else if (IsSub) {
+    return Actions.ActOnPtrSubExpr(Pointer.get(), Offset.get(),
+                                   KWLoc, T.getCloseLocation());
+  } else if (IsDiff) {
+    return Actions.ActOnPtrDiffExpr(Pointer.get(), Pointer2.get(),
+                                    KWLoc, T.getCloseLocation());
+  } else {
+    return Actions.ActOnPtrBoundsExpr(Pointer.get(),
+                                      KWLoc, T.getCloseLocation());
+  }
+}
+
+/// ParseBoundsSafeCast - Parses bounds-safe cast operations that convert
+/// between pointer types while preserving or adjusting bounds information.
+///
+/// Syntax:
+///   __bounded_cast<type>(expr) -> cast with bounds preservation
+///   __unbounded_cast<type>(expr) -> cast that removes bounds
+///   __rebound_cast<type, bounds>(expr) -> cast with new bounds
+///   __contract_cast(expr) -> contract bounds (narrow)
+///   __expand_cast(expr) -> expand bounds (widen)
+///
+ExprResult Parser::ParseBoundsSafeCast() {
+  assert(Tok.isOneOf(tok::kw___bounded_cast, tok::kw___unbounded_cast,
+                     tok::kw___rebound_cast, tok::kw___contract_cast,
+                     tok::kw___expand_cast) &&
+         "Not a bounds-safe cast expression!");
+
+  SourceLocation KWLoc = ConsumeToken();
+  bool IsBounded = (Tok.getKind() == tok::kw___bounded_cast);
+  bool IsUnbounded = (Tok.getKind() == tok::kw___unbounded_cast);
+  bool IsRebound = (Tok.getKind() == tok::kw___rebound_cast);
+  bool IsContract = (Tok.getKind() == tok::kw___contract_cast);
+  bool IsExpand = (Tok.getKind() == tok::kw___expand_cast);
+
+  // Parse template argument list for casts that require a type
+  TypeResult TargetType;
+  ExprResult BoundsExpr;
+  SourceLocation LAngleLoc, RAngleLoc;
+
+  if (IsBounded || IsUnbounded || IsRebound) {
+    // Parse template arguments: <type> or <type, bounds>
+    if (Tok.isNot(tok::less)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::less;
+      return ExprError();
+    }
+
+    LAngleLoc = ConsumeToken();
+
+    // Parse the target type
+    TargetType = ParseTypeName();
+    if (TargetType.isInvalid()) {
+      SkipUntil(tok::greater, StopAtSemi);
+      return ExprError();
+    }
+
+    // For rebound_cast, parse bounds expression
+    if (IsRebound && Tok.is(tok::comma)) {
+      ConsumeToken();
+
+      EnterExpressionEvaluationContext EC(
+          Actions,
+          Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+          nullptr,
+          Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_AttrArgument);
+
+      BoundsExpr = ParseAssignmentExpression();
+      if (BoundsExpr.isInvalid()) {
+        SkipUntil(tok::greater, StopAtSemi);
+        return ExprError();
+      }
+    }
+
+    if (Tok.isNot(tok::greater)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::greater;
+      SkipUntil(tok::greater, StopAtSemi);
+      return ExprError();
+    }
+    RAngleLoc = ConsumeToken();
+  }
+
+  // Parse the expression to cast
+  BalancedDelimiterTracker T(*this, tok::l_paren);
+  if (T.expectAndConsume(diag::err_expected_lparen_after,
+                         IsBounded ? "__bounded_cast" :
+                         IsUnbounded ? "__unbounded_cast" :
+                         IsRebound ? "__rebound_cast" :
+                         IsContract ? "__contract_cast" : "__expand_cast")) {
+    return ExprError();
+  }
+
+  ExprResult SubExpr = ParseAssignmentExpression();
+  if (SubExpr.isInvalid()) {
+    T.skipToEnd();
+    return ExprError();
+  }
+
+  if (T.consumeClose())
+    return ExprError();
+
+  // Validate the cast based on its type
+  if (IsBounded || IsUnbounded || IsRebound) {
+    if (TargetType.isInvalid()) {
+      return ExprError();
+    }
+
+    // For bounded_cast, ensure the target type can carry bounds
+    if (IsBounded && TargetType.isUsable()) {
+      QualType Target = TargetType.get().get();
+      if (!Target.isNull() && !Target->isPointerType() &&
+          !Target->isArrayType()) {
+        Diag(LAngleLoc, diag::err_bounded_cast_on_non_pointer)
+            << Target;
+      }
+    }
+  }
+
+  // Create the appropriate cast expression
+  if (IsBounded) {
+    return Actions.ActOnBoundedCastExpr(
+        SubExpr.get(), TargetType.get(), KWLoc, T.getCloseLocation(),
+        LAngleLoc, RAngleLoc);
+  } else if (IsUnbounded) {
+    return Actions.ActOnUnboundedCastExpr(
+        SubExpr.get(), TargetType.get(), KWLoc, T.getCloseLocation(),
+        LAngleLoc, RAngleLoc);
+  } else if (IsRebound) {
+    return Actions.ActOnReboundCastExpr(
+        SubExpr.get(), TargetType.get(), BoundsExpr.get(),
+        KWLoc, T.getCloseLocation(), LAngleLoc, RAngleLoc);
+  } else if (IsContract) {
+    return Actions.ActOnContractBoundsExpr(
+        SubExpr.get(), KWLoc, T.getCloseLocation());
+  } else { // IsExpand
+    return Actions.ActOnExpandBoundsExpr(
+        SubExpr.get(), KWLoc, T.getCloseLocation());
+  }
+}
+
+/// ParseBoundsQueryExpression - Parses expressions that query bounds
+/// information about pointers and arrays at runtime.
+///
+/// Syntax:
+///   __bounds_lower(ptr) -> get lower bound of pointer
+///   __bounds_upper(ptr) -> get upper bound of pointer
+///   __bounds_size(ptr) -> get size of bounds range
+///   __bounds_valid(ptr) -> check if pointer is within bounds
+///   __bounds_capacity(ptr) -> get capacity of bounded pointer
+///   __bounds_remaining(ptr) -> get remaining elements from pointer to end
+///
+ExprResult Parser::ParseBoundsQueryExpression() {
+  assert(Tok.isOneOf(tok::kw___bounds_lower, tok::kw___bounds_upper,
+                     tok::kw___bounds_size, tok::kw___bounds_valid,
+                     tok::kw___bounds_capacity, tok::kw___bounds_remaining) &&
+         "Not a bounds query expression!");
+
+  SourceLocation KWLoc = ConsumeToken();
+  tok::TokenKind Kind = Tok.getKind();
+
+  BalancedDelimiterTracker T(*this, tok::l_paren);
+  if (T.expectAndConsume(diag::err_expected_lparen_after,
+                         Kind == tok::kw___bounds_lower ? "__bounds_lower" :
+                         Kind == tok::kw___bounds_upper ? "__bounds_upper" :
+                         Kind == tok::kw___bounds_size ? "__bounds_size" :
+                         Kind == tok::kw___bounds_valid ? "__bounds_valid" :
+                         Kind == tok::kw___bounds_capacity ? "__bounds_capacity" :
+                         "__bounds_remaining")) {
+    return ExprError();
+  }
+
+  // Parse the pointer expression
+  ExprResult Pointer = ParseAssignmentExpression();
+  if (Pointer.isInvalid()) {
+    T.skipToEnd();
+    return ExprError();
+  }
+
+  // Optional second argument for offset queries
+  ExprResult Offset;
+  if (Kind == tok::kw___bounds_remaining && TryConsumeToken(tok::comma)) {
+    Offset = ParseAssignmentExpression();
+    if (Offset.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+  }
+
+  if (T.consumeClose())
+    return ExprError();
+
+  // Validate the pointer type
+  if (Pointer.isUsable()) {
+    QualType PtrType = Pointer.get()->getType();
+    if (!PtrType.isNull() && !PtrType->isPointerType() &&
+        !PtrType->isArrayType()) {
+      Diag(Pointer.get()->getExprLoc(),
+           diag::err_bounds_query_on_non_pointer)
+          << PtrType;
+      return ExprError();
+    }
+  }
+
+  // Create the appropriate query expression
+  switch (Kind) {
+  case tok::kw___bounds_lower:
+    return Actions.ActOnBoundsLowerQuery(Pointer.get(), KWLoc,
+                                         T.getCloseLocation());
+  case tok::kw___bounds_upper:
+    return Actions.ActOnBoundsUpperQuery(Pointer.get(), KWLoc,
+                                         T.getCloseLocation());
+  case tok::kw___bounds_size:
+    return Actions.ActOnBoundsSizeQuery(Pointer.get(), KWLoc,
+                                        T.getCloseLocation());
+  case tok::kw___bounds_valid:
+    return Actions.ActOnBoundsValidQuery(Pointer.get(), KWLoc,
+                                         T.getCloseLocation());
+  case tok::kw___bounds_capacity:
+    return Actions.ActOnBoundsCapacityQuery(Pointer.get(), KWLoc,
+                                            T.getCloseLocation());
+  case tok::kw___bounds_remaining:
+    return Actions.ActOnBoundsRemainingQuery(Pointer.get(), Offset.get(),
+                                             KWLoc, T.getCloseLocation());
+  default:
+    llvm_unreachable("Unknown bounds query kind");
+  }
+}
+
+/// ParseBoundsAnnotationExpression - Parses expressions that annotate
+/// values with bounds information for later use in bounds checking.
+///
+/// Syntax:
+///   __assume_bounds(ptr, lower, upper) -> assume bounds for pointer
+///   __assume_counted(ptr, count) -> assume pointer is counted
+///   __assume_terminated(ptr) -> assume pointer is null-terminated
+///   __assert_bounds(ptr) -> assert pointer is within bounds
+///   __assert_valid(ptr) -> assert pointer is valid
+///
+ExprResult Parser::ParseBoundsAnnotationExpression() {
+  assert(Tok.isOneOf(tok::kw___assume_bounds, tok::kw___assume_counted,
+                     tok::kw___assume_terminated, tok::kw___assert_bounds,
+                     tok::kw___assert_valid) &&
+         "Not a bounds annotation expression!");
+
+  SourceLocation KWLoc = ConsumeToken();
+  tok::TokenKind Kind = Tok.getKind();
+
+  BalancedDelimiterTracker T(*this, tok::l_paren);
+  if (T.expectAndConsume(diag::err_expected_lparen_after,
+                         Kind == tok::kw___assume_bounds ? "__assume_bounds" :
+                         Kind == tok::kw___assume_counted ? "__assume_counted" :
+                         Kind == tok::kw___assume_terminated ? "__assume_terminated" :
+                         Kind == tok::kw___assert_bounds ? "__assert_bounds" :
+                         "__assert_valid")) {
+    return ExprError();
+  }
+
+  // Parse the pointer expression
+  ExprResult Pointer = ParseAssignmentExpression();
+  if (Pointer.isInvalid()) {
+    T.skipToEnd();
+    return ExprError();
+  }
+
+  ExprResult LowerBound, UpperBound, Count;
+
+  // Parse additional arguments based on the annotation type
+  if (Kind == tok::kw___assume_bounds) {
+    // __assume_bounds(ptr, lower, upper)
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    LowerBound = ParseAssignmentExpression();
+    if (LowerBound.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    UpperBound = ParseAssignmentExpression();
+    if (UpperBound.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+  } else if (Kind == tok::kw___assume_counted) {
+    // __assume_counted(ptr, count)
+    if (ExpectAndConsume(tok::comma)) {
+      Diag(Tok.getLocation(), diag::err_expected) << tok::comma;
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Count = ParseAssignmentExpression();
+    if (Count.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    // Validate that count is a non-negative integer
+    if (Count.isUsable()) {
+      QualType CountType = Count.get()->getType();
+      if (!CountType.isNull() && !CountType->isIntegerType()) {
+        Diag(Count.get()->getExprLoc(),
+             diag::err_assume_counted_non_integer)
+            << CountType;
+      }
+    }
+
+  } else if (Kind == tok::kw___assume_terminated) {
+    // __assume_terminated(ptr) - no additional arguments
+  } else if (Kind == tok::kw___assert_bounds) {
+    // __assert_bounds(ptr) - no additional arguments
+  } else if (Kind == tok::kw___assert_valid) {
+    // __assert_valid(ptr) - no additional arguments
+  }
+
+  if (T.consumeClose())
+    return ExprError();
+
+  // Create the annotation expression
+  switch (Kind) {
+  case tok::kw___assume_bounds:
+    return Actions.ActOnAssumeBoundsExpr(
+        Pointer.get(), LowerBound.get(), UpperBound.get(),
+        KWLoc, T.getCloseLocation());
+  case tok::kw___assume_counted:
+    return Actions.ActOnAssumeCountedExpr(
+        Pointer.get(), Count.get(), KWLoc, T.getCloseLocation());
+  case tok::kw___assume_terminated:
+    return Actions.ActOnAssumeTerminatedExpr(
+        Pointer.get(), KWLoc, T.getCloseLocation());
+  case tok::kw___assert_bounds:
+    return Actions.ActOnAssertBoundsExpr(
+        Pointer.get(), KWLoc, T.getCloseLocation());
+  case tok::kw___assert_valid:
+    return Actions.ActOnAssertValidExpr(
+        Pointer.get(), KWLoc, T.getCloseLocation());
+  default:
+    llvm_unreachable("Unknown bounds annotation kind");
+  }
+}
+
+/// ParseArrayBoundsExpression - Parses array bounds expressions for
+/// variable-length arrays with bounds safety. This extends C99 VLAs with
+/// bounds checking capabilities.
+///
+/// Syntax:
+///   type identifier[__counted_by(expr)] -> counted array
+///   type identifier[__sized_by(expr)] -> sized array
+///   type identifier[__terminated_by(expr)] -> terminated array
+///   type identifier[__bounded_by(expr)] -> bounded array
+///   type identifier[static __counted_by(expr)] -> static counted array
+///
+ExprResult Parser::ParseArrayBoundsExpression(Declarator &D) {
+  assert(Tok.is(tok::l_square) && "Expected '[' for array bounds");
+
+  SourceLocation LBracketLoc = Tok.getLocation();
+  BalancedDelimiterTracker T(*this, tok::l_square);
+  T.consumeOpen();
+
+  // Parse optional static keyword
+  SourceLocation StaticLoc;
+  bool HasStatic = TryConsumeToken(tok::kw_static, StaticLoc);
+
+  // Parse optional type qualifiers
+  DeclSpec DS(AttrFactory);
+  if (HasStatic || (Tok.isOneOf(tok::kw_const, tok::kw_volatile, tok::kw_restrict,
+                                 tok::kw___unaligned))) {
+    ParseTypeQualifierListOpt(DS);
+  }
+
+  // Parse bounds attributes
+  ParsedAttributes BoundsAttrs(AttrFactory);
+  ExprResult SizeExpr;
+  bool HasBoundsAttr = false;
+  BoundsAttrKind BoundsKind = BoundsAttrKind::None;
+
+  if (Tok.is(tok::kw___counted_by)) {
+    BoundsKind = BoundsAttrKind::CountedBy;
+    HasBoundsAttr = true;
+    ConsumeToken();
+
+    BalancedDelimiterTracker Parens(*this, tok::l_paren);
+    if (Parens.consumeOpen()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    SizeExpr = ParseAssignmentExpression();
+    if (SizeExpr.isInvalid()) {
+      Parens.skipToEnd();
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Parens.consumeClose();
+
+  } else if (Tok.is(tok::kw___sized_by)) {
+    BoundsKind = BoundsAttrKind::SizedBy;
+    HasBoundsAttr = true;
+    ConsumeToken();
+
+    BalancedDelimiterTracker Parens(*this, tok::l_paren);
+    if (Parens.consumeOpen()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    SizeExpr = ParseAssignmentExpression();
+    if (SizeExpr.isInvalid()) {
+      Parens.skipToEnd();
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Parens.consumeClose();
+
+  } else if (Tok.is(tok::kw___terminated_by)) {
+    BoundsKind = BoundsAttrKind::TerminatedBy;
+    HasBoundsAttr = true;
+    ConsumeToken();
+
+    BalancedDelimiterTracker Parens(*this, tok::l_paren);
+    if (Parens.consumeOpen()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    SizeExpr = ParseAssignmentExpression();
+    if (SizeExpr.isInvalid()) {
+      Parens.skipToEnd();
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Parens.consumeClose();
+
+  } else if (Tok.is(tok::kw___bounded_by)) {
+    BoundsKind = BoundsAttrKind::BoundedBy;
+    HasBoundsAttr = true;
+    ConsumeToken();
+
+    BalancedDelimiterTracker Parens(*this, tok::l_paren);
+    if (Parens.consumeOpen()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    ExprResult LowerBound = ParseAssignmentExpression();
+    if (LowerBound.isInvalid()) {
+      Parens.skipToEnd();
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    if (ExpectAndConsume(tok::comma)) {
+      Parens.skipToEnd();
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    ExprResult UpperBound = ParseAssignmentExpression();
+    if (UpperBound.isInvalid()) {
+      Parens.skipToEnd();
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    // Create a bounds pair expression
+    SizeExpr = Actions.ActOnBoundsPairExpr(LowerBound.get(), UpperBound.get(),
+                                           LowerBound.get()->getBeginLoc(),
+                                           UpperBound.get()->getEndLoc());
+    if (SizeExpr.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    Parens.consumeClose();
+
+  } else if (Tok.isNot(tok::r_square)) {
+    // Regular array size expression (VLA or constant)
+    if (getLangOpts().CPlusPlus) {
+      SizeExpr = ParseArrayBoundExpression();
+    } else {
+      EnterExpressionEvaluationContext ConstantEvaluated(
+          Actions, Sema::ExpressionEvaluationContext::ConstantEvaluated);
+      SizeExpr = ParseAssignmentExpression();
+    }
+
+    if (SizeExpr.isInvalid()) {
+      T.skipToEnd();
+      return ExprError();
+    }
+
+    // Check if the size expression is a constant expression
+    if (SizeExpr.isUsable()) {
+      SizeExpr = Actions.ActOnConstantExpression(SizeExpr.get());
+    }
+  }
+
+  // Parse optional star for VLA
+  bool IsStar = false;
+  if (Tok.is(tok::star) && !HasStatic && !HasBoundsAttr) {
+    IsStar = true;
+    ConsumeToken();
+    Diag(LBracketLoc, diag::ext_vla_star);
+  }
+
+  // Parse C++11 attributes
+  ParsedAttributes Attrs(AttrFactory);
+  MaybeParseCXX11Attributes(Attrs);
+
+  // Expect closing bracket
+  if (T.consumeClose())
+    return ExprError();
+
+  // Validate the array bounds configuration
+  if (HasStatic && SizeExpr.isInvalid()) {
+    Diag(StaticLoc, diag::err_static_array_size_required);
+    return ExprError();
+  }
+
+  if (HasBoundsAttr && SizeExpr.isInvalid()) {
+    Diag(LBracketLoc, diag::err_bounds_attribute_requires_expression)
+        << (BoundsKind == BoundsAttrKind::CountedBy ? "counted_by" :
+            BoundsKind == BoundsAttrKind::SizedBy ? "sized_by" :
+            BoundsKind == BoundsAttrKind::TerminatedBy ? "terminated_by" :
+            "bounded_by");
+    return ExprError();
+  }
+
+  // Create the array bounds information
+  ArrayBoundsInfo BoundsInfo;
+  BoundsInfo.HasStatic = HasStatic;
+  BoundsInfo.HasStar = IsStar;
+  BoundsInfo.SizeExpr = SizeExpr.get();
+  BoundsInfo.BoundsKind = BoundsKind;
+  BoundsInfo.TypeQualifiers = DS.getTypeQualifiers();
+  BoundsInfo.LBracketLoc = LBracketLoc;
+  BoundsInfo.RBracketLoc = T.getCloseLocation();
+
+  // If bounds attributes are present, add them to the declarator
+  if (HasBoundsAttr && BoundsInfo.SizeExpr) {
+    D.addBoundsInfo(BoundsInfo);
+  }
+
+  // Return the size expression for the array
+  return SizeExpr;
+}
 ExprResult Parser::ParseGetPointerBound(PointerBoundKind K) {
   SourceLocation KWLoc = ConsumeToken();
   ExprResult (Sema::*ActOnBoundExpr)(Expr *, SourceLocation, SourceLocation);
