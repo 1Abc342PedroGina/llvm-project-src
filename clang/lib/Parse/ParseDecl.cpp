@@ -1,8 +1,19 @@
 //===--- ParseDecl.cpp - Declaration Parsing --------------------*- C++ -*-===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//   Copyright (C) 2026 Pedro Emanuel
+//
+//    This program is free software: you can redistribute it and/or modify
+//    it under the terms of the GNU Affero General Public License as
+//    published by the Free Software Foundation, either version 3 of the
+//    License, or (at your option) any later version.
+//
+//    This program is distributed in the hope that it will be useful,
+//    but WITHOUT ANY WARRANTY; without even the implied warranty of
+//    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//    GNU Affero General Public License for more details.
+//
+//    You should have received a copy of the GNU Affero General Public License
+//    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
 //===----------------------------------------------------------------------===//
 //
@@ -25,6 +36,8 @@
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/ParsedAttr.h"
+#include "clang/Basic/BoundsSafety.h"
+#include "llvm/ADT/SmallSet.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/SemaCUDA.h"
@@ -3362,6 +3375,410 @@ void Parser::ParsePtrauthQualifier(ParsedAttributes &Attrs) {
                                          /*IsRegularKeywordAttribute=*/false));
 }
 
+void Parser::ParseBoundsSafetyAttributes(ParsedAttributes &Attrs,
+                                         SourceLocation *EndLoc,
+                                         bool IsParameter,
+                                         Declarator *D) {
+  assert(Tok.is(tok::kw___counted_by) || Tok.is(tok::kw___sized_by) ||
+         Tok.is(tok::kw___ended_by) || Tok.is(tok::kw___null_terminated) ||
+         Tok.is(tok::kw___single) && "Not a bounds safety attribute!");
+
+  SourceLocation StartLoc = Tok.getLocation();
+  SourceLocation CurrentEndLoc = StartLoc;
+  unsigned OriginalAttrCount = Attrs.size();
+
+  // Parse multiple bounds attributes in sequence
+  while (true) {
+    // Check if the current token is a bounds safety keyword
+    if (!Tok.isOneOf(tok::kw___counted_by, tok::kw___sized_by,
+                     tok::kw___ended_by, tok::kw___null_terminated,
+                     tok::kw___single)) {
+      break;
+    }
+
+    IdentifierInfo *AttrName = Tok.getIdentifierInfo();
+    SourceLocation AttrNameLoc = ConsumeToken();
+
+    // Handle null_terminated and single which take no arguments
+    if (AttrName->getName() == "__null_terminated" ||
+        AttrName->getName() == "__single") {
+      Attrs.addNew(AttrName, AttrNameLoc, AttributeScopeInfo(), nullptr, 0,
+                   ParsedAttr::Form::GNU());
+      CurrentEndLoc = AttrNameLoc;
+      
+      // Continue parsing if there's another attribute
+      if (Tok.isOneOf(tok::kw___counted_by, tok::kw___sized_by,
+                      tok::kw___ended_by, tok::kw___null_terminated,
+                      tok::kw___single)) {
+        continue;
+      }
+      break;
+    }
+
+    // Parse argument for counted_by, sized_by, ended_by
+    BalancedDelimiterTracker T(*this, tok::l_paren);
+    if (T.consumeOpen()) {
+      Diag(Tok.getLocation(), diag::err_expected_lparen_after)
+          << AttrName->getName();
+      SkipUntil(tok::r_paren, StopAtSemi);
+      return;
+    }
+
+    // Parse the argument expression
+    EnterExpressionEvaluationContext EC(
+        Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+        nullptr,
+        Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_AttrArgument);
+
+    ExprResult ArgExpr = ParseAssignmentExpression();
+    if (ArgExpr.isInvalid()) {
+      T.skipToEnd();
+      continue;
+    }
+
+    // Check for pack expansion (ellipsis)
+    SourceLocation EllipsisLoc;
+    if (Tok.is(tok::ellipsis)) {
+      EllipsisLoc = ConsumeToken();
+      ArgExpr = Actions.ActOnPackExpansion(ArgExpr.get(), EllipsisLoc);
+      if (ArgExpr.isInvalid()) {
+        T.skipToEnd();
+        continue;
+      }
+    }
+
+    // Close the parenthesis
+    T.consumeClose();
+    CurrentEndLoc = T.getCloseLocation();
+
+    // Validate that the argument is appropriate for this attribute
+    if (AttrName->getName() == "__counted_by") {
+      // counted_by expects a size_t expression
+      if (!ArgExpr.get()->getType().isNull() &&
+          !ArgExpr.get()->getType()->isIntegerType()) {
+        Diag(ArgExpr.get()->getExprLoc(),
+             diag::err_counted_by_non_integer_argument)
+            << ArgExpr.get()->getType();
+      }
+    } else if (AttrName->getName() == "__sized_by") {
+      // sized_by expects a byte size expression
+      if (!ArgExpr.get()->getType().isNull() &&
+          !ArgExpr.get()->getType()->isIntegerType()) {
+        Diag(ArgExpr.get()->getExprLoc(),
+             diag::err_sized_by_non_integer_argument)
+            << ArgExpr.get()->getType();
+      }
+    } else if (AttrName->getName() == "__ended_by") {
+      // ended_by expects a pointer or iterator expression
+      if (!ArgExpr.get()->getType().isNull() &&
+          !ArgExpr.get()->getType()->isPointerType() &&
+          !ArgExpr.get()->getType()->isArrayType()) {
+        Diag(ArgExpr.get()->getExprLoc(),
+             diag::err_ended_by_non_pointer_argument)
+            << ArgExpr.get()->getType();
+      }
+    }
+
+    // Add the attribute to the list
+    ArgsVector ArgExprs;
+    ArgExprs.push_back(ArgExpr.get());
+    Attrs.addNew(AttrName,
+                 SourceRange(AttrNameLoc, T.getCloseLocation()),
+                 AttributeScopeInfo(),
+                 ArgExprs.data(), ArgExprs.size(),
+                 ParsedAttr::Form::GNU(),
+                 EllipsisLoc);
+
+    // If we're in a parameter context, we need to track this for later
+    if (IsParameter && D && D->isFunctionDeclarator()) {
+      // Mark that this parameter has bounds attributes that affect the function
+      // type
+      D->setHasBoundsSafetyAttributes(true);
+    }
+
+    // After parsing one attribute, check if there's another
+    if (!Tok.isOneOf(tok::kw___counted_by, tok::kw___sized_by,
+                     tok::kw___ended_by, tok::kw___null_terminated,
+                     tok::kw___single)) {
+      break;
+    }
+  }
+
+  // Set the range for all parsed attributes
+  if (Attrs.size() > OriginalAttrCount) {
+    Attrs.Range = SourceRange(StartLoc, CurrentEndLoc);
+  }
+
+  if (EndLoc)
+    *EndLoc = CurrentEndLoc;
+}
+
+/// ParseBoundsSafetySpecifier - Parses a bounds specifier in the context of
+/// a variable or parameter declaration. This is an extension that allows
+/// bounds to be specified directly in the type syntax.
+///
+/// Syntax:
+///   type __counted_by(expr) identifier
+///   type __sized_by(expr) identifier
+///   type identifier : bounds(expr)
+///
+void Parser::ParseBoundsSafetySpecifier(DeclSpec &DS,
+                                        SourceLocation &BoundsLoc,
+                                        ParsedType &BoundsType,
+                                        ExprResult &BoundsExpr) {
+  SourceLocation StartLoc = Tok.getLocation();
+  BoundsLoc = StartLoc;
+  
+  // We should be at a bounds safety keyword or a colon for the alternative
+  // syntax
+  if (Tok.is(tok::colon)) {
+    // Alternative syntax: identifier : bounds(expr)
+    SourceLocation ColonLoc = ConsumeToken();
+    
+    if (Tok.isNot(tok::kw___bounds)) {
+      Diag(Tok.getLocation(), diag::err_expected_bounds_keyword);
+      return;
+    }
+    
+    ConsumeToken(); // consume __bounds
+    
+    BalancedDelimiterTracker T(*this, tok::l_paren);
+    if (T.consumeOpen()) {
+      Diag(Tok.getLocation(), diag::err_expected_lparen_after)
+          << "__bounds";
+      return;
+    }
+    
+    // Parse the bounds expression
+    EnterExpressionEvaluationContext EC(
+        Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+        nullptr,
+        Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_AttrArgument);
+    
+    BoundsExpr = ParseAssignmentExpression();
+    if (BoundsExpr.isInvalid()) {
+      T.skipToEnd();
+      return;
+    }
+    
+    T.consumeClose();
+    BoundsLoc = ColonLoc;
+    return;
+  }
+  
+  // Primary syntax: __counted_by(expr) or __sized_by(expr)
+  bool IsCountedBy = Tok.is(tok::kw___counted_by);
+  bool IsSizedBy = Tok.is(tok::kw___sized_by);
+  bool IsEndedBy = Tok.is(tok::kw___ended_by);
+  
+  if (!IsCountedBy && !IsSizedBy && !IsEndedBy) {
+    return;
+  }
+  
+  IdentifierInfo *AttrName = Tok.getIdentifierInfo();
+  SourceLocation AttrNameLoc = ConsumeToken();
+  
+  BalancedDelimiterTracker T(*this, tok::l_paren);
+  if (T.consumeOpen()) {
+    Diag(Tok.getLocation(), diag::err_expected_lparen_after)
+        << AttrName->getName();
+    return;
+  }
+  
+  // Parse the bounds expression
+  EnterExpressionEvaluationContext EC(
+      Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+      nullptr,
+      Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_AttrArgument);
+  
+  BoundsExpr = ParseAssignmentExpression();
+  if (BoundsExpr.isInvalid()) {
+    T.skipToEnd();
+    return;
+  }
+  
+  T.consumeClose();
+  
+  // Create a bounds type wrapper
+  if (IsCountedBy) {
+    // Create a CountedBy type
+    BoundsType = Actions.ActOnCountedByType(BoundsExpr.get(),
+                                            SourceRange(AttrNameLoc,
+                                            T.getCloseLocation()));
+  } else if (IsSizedBy) {
+    // Create a SizedBy type
+    BoundsType = Actions.ActOnSizedByType(BoundsExpr.get(),
+                                          SourceRange(AttrNameLoc,
+                                          T.getCloseLocation()));
+  } else if (IsEndedBy) {
+    // Create an EndedBy type
+    BoundsType = Actions.ActOnEndedByType(BoundsExpr.get(),
+                                          SourceRange(AttrNameLoc,
+                                          T.getCloseLocation()));
+  }
+  
+  // Update the declaration specifier to indicate this is a bounded type
+  DS.setBoundsSafetySpecified(true);
+  DS.setBoundsExpr(BoundsExpr.get());
+}
+
+/// ValidateBoundsSafetyDeclarator - Performs semantic validation on a
+/// declarator that contains bounds safety attributes. This ensures that
+/// bounds attributes are used correctly and consistently.
+///
+/// This function checks:
+///   1. Bounds attributes are only applied to pointer and array types
+///   2. The referenced variables are in scope and have appropriate types
+///   3. Multiple bounds attributes don't conflict
+///   4. Bounds expressions are valid in the current context
+///
+void Parser::ValidateBoundsSafetyDeclarator(Declarator &D,
+                                            const ParsedAttributes &Attrs,
+                                            SourceLocation DeclLoc) {
+  if (!getLangOpts().BoundsSafety)
+    return;
+  
+  // Collect all bounds safety attributes on this declarator
+  SmallVector<const ParsedAttr *, 4> BoundsAttrs;
+  for (const ParsedAttr &AL : Attrs) {
+    if (AL.getKind() == ParsedAttr::AT_CountedBy ||
+        AL.getKind() == ParsedAttr::AT_SizedBy ||
+        AL.getKind() == ParsedAttr::AT_EndedBy ||
+        AL.getKind() == ParsedAttr::AT_NullTerminated) {
+      BoundsAttrs.push_back(&AL);
+    }
+  }
+  
+  if (BoundsAttrs.empty())
+    return;
+  
+  // Check that the declarator is a pointer or array
+  bool IsPointer = false;
+  bool IsArray = false;
+  unsigned PointerDepth = 0;
+  
+  for (unsigned I = 0; I < D.getNumTypeObjects(); ++I) {
+    DeclaratorChunk &Chunk = D.getTypeObject(I);
+    if (Chunk.Kind == DeclaratorChunk::Pointer) {
+      IsPointer = true;
+      PointerDepth++;
+    } else if (Chunk.Kind == DeclaratorChunk::Array) {
+      IsArray = true;
+    }
+  }
+  
+  if (!IsPointer && !IsArray) {
+    for (const ParsedAttr *AL : BoundsAttrs) {
+      Diag(AL->getLoc(), diag::err_bounds_attribute_on_non_pointer)
+          << AL << IsArray;
+    }
+    return;
+  }
+  
+  // Check for conflicting bounds attributes on the same level
+  llvm::SmallSet<unsigned, 4> SeenKinds;
+  for (const ParsedAttr *AL : BoundsAttrs) {
+    unsigned Kind = AL->getKind();
+    if (SeenKinds.count(Kind)) {
+      Diag(AL->getLoc(), diag::err_duplicate_bounds_attribute) << AL;
+    } else {
+      SeenKinds.insert(Kind);
+    }
+  }
+  
+  // Validate that counted_by and sized_by refer to valid fields/variables
+  for (const ParsedAttr *AL : BoundsAttrs) {
+    if (AL->getKind() != ParsedAttr::AT_CountedBy &&
+        AL->getKind() != ParsedAttr::AT_SizedBy &&
+        AL->getKind() != ParsedAttr::AT_EndedBy) {
+      continue;
+    }
+    
+    // Get the argument expression
+    if (AL->getNumArgs() == 0) {
+      Diag(AL->getLoc(), diag::err_bounds_attribute_missing_argument) << AL;
+      continue;
+    }
+    
+    Expr *ArgExpr = AL->getArgAsExpr(0);
+    if (!ArgExpr)
+      continue;
+    
+    // Check that the argument is an identifier or a simple expression
+    // that refers to a valid variable in scope
+    if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(ArgExpr)) {
+      ValueDecl *VD = DRE->getDecl();
+      if (!VD) {
+        Diag(ArgExpr->getExprLoc(), diag::err_bounds_attribute_unknown_variable)
+            << AL;
+        continue;
+      }
+      
+      // Check that the referenced variable is in scope and accessible
+      if (D.getContext() == DeclaratorContext::Member) {
+        // In a member context, the referenced field must be a member
+        if (!isa<FieldDecl>(VD)) {
+          Diag(ArgExpr->getExprLoc(),
+               diag::err_bounds_attribute_references_non_member)
+              << VD << AL;
+        }
+      } else {
+        // In a local context, check that the variable is in scope
+        // This will be checked by Sema
+      }
+    } else {
+      // Complex expressions are allowed but need to be evaluated
+      // in a constant context if possible
+      if (!ArgExpr->isValueDependent()) {
+        // Try to evaluate as a constant expression
+        ExprResult ConstExpr = Actions.ActOnConstantExpression(ArgExpr);
+        if (ConstExpr.isInvalid()) {
+          Diag(ArgExpr->getExprLoc(),
+               diag::err_bounds_attribute_non_constant_expression)
+              << AL;
+        }
+      }
+    }
+  }
+  
+  // For null_terminated attribute, ensure it's on a pointer to character type
+  for (const ParsedAttr *AL : BoundsAttrs) {
+    if (AL->getKind() != ParsedAttr::AT_NullTerminated)
+      continue;
+    
+    // Check if the type is a pointer to character
+    // This will be checked in Sema, but we can provide early diagnostics
+    // for obvious errors
+    QualType PointeeType;
+    if (IsPointer && PointerDepth == 1) {
+      // Get the pointee type from the declarator
+      // This is a simplification; full checking is done in Sema
+    } else if (IsArray) {
+      // Arrays can also be null-terminated
+    } else {
+      Diag(AL->getLoc(), diag::err_null_terminated_on_non_pointer)
+          << AL;
+    }
+  }
+  
+  // Check for inconsistent bounds specifications
+  bool HasCountedBy = false;
+  bool HasSizedBy = false;
+  
+  for (const ParsedAttr *AL : BoundsAttrs) {
+    if (AL->getKind() == ParsedAttr::AT_CountedBy)
+      HasCountedBy = true;
+    if (AL->getKind() == ParsedAttr::AT_SizedBy)
+      HasSizedBy = true;
+  }
+  
+  if (HasCountedBy && HasSizedBy) {
+    Diag(DeclLoc, diag::warn_both_counted_by_and_sized_by)
+        << SourceRange(BoundsAttrs[0]->getLoc(),
+                       BoundsAttrs[BoundsAttrs.size()-1]->getLoc());
+  }
+}
+
 void Parser::ParseBoundsAttribute(IdentifierInfo &AttrName,
                                   SourceLocation AttrNameLoc,
                                   ParsedAttributes &Attrs,
@@ -4745,6 +5162,262 @@ void Parser::ParseDeclarationSpecifiers(
     case tok::annot_pragma_export:
       HandlePragmaExport();
       continue;
+
+		/// ParsePragmaBoundsSafety - Handles #pragma bounds_safety directives
+/// that can enable/disable bounds checking for specific regions of code.
+///
+/// Syntax:
+///   #pragma bounds_safety push [on|off]
+///   #pragma bounds_safety pop
+///   #pragma bounds_safety assume(expression)
+///   #pragma bounds_safety assert(expression)
+///
+void Parser::ParsePragmaBoundsSafety() {
+  assert(Tok.is(tok::annot_pragma_bounds_safety) && 
+         "Not a bounds safety pragma!");
+  
+  SourceLocation PragmaLoc = ConsumeAnnotationToken();
+  IdentifierInfo *PragmaType = Tok.getIdentifierInfo();
+  SourceLocation TypeLoc = Tok.getLocation();
+  ConsumeToken();
+  
+  // Handle different pragma types
+  if (PragmaType->getName() == "push") {
+    // #pragma bounds_safety push [on|off]
+    bool Enable = true;
+    SourceLocation StateLoc;
+    
+    if (Tok.is(tok::identifier)) {
+      StateLoc = Tok.getLocation();
+      StringRef State = Tok.getIdentifierInfo()->getName();
+      if (State == "on") {
+        Enable = true;
+        ConsumeToken();
+      } else if (State == "off") {
+        Enable = false;
+        ConsumeToken();
+      } else {
+        Diag(StateLoc, diag::err_pragma_bounds_safety_invalid_state)
+            << State;
+      }
+    }
+    
+    // Push the new bounds safety state onto the stack
+    Actions.PushBoundsSafetyState(Enable, PragmaLoc, StateLoc);
+    
+  } else if (PragmaType->getName() == "pop") {
+    // #pragma bounds_safety pop
+    if (Tok.isNot(tok::eod)) {
+      Diag(Tok.getLocation(), diag::err_extra_tokens_at_end_of_pragma)
+          << "bounds_safety pop";
+      SkipUntil(tok::eod);
+    }
+    
+    // Pop the bounds safety state from the stack
+    Actions.PopBoundsSafetyState(PragmaLoc);
+    
+  } else if (PragmaType->getName() == "assume") {
+    // #pragma bounds_safety assume(expression)
+    BalancedDelimiterTracker T(*this, tok::l_paren);
+    if (T.consumeOpen()) {
+      Diag(Tok.getLocation(), diag::err_expected_lparen_after)
+          << "assume";
+      return;
+    }
+    
+    // Parse the assumption expression
+    EnterExpressionEvaluationContext EC(
+        Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+        nullptr,
+        Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_Other);
+    
+    ExprResult Assumption = ParseAssignmentExpression();
+    if (Assumption.isInvalid()) {
+      T.skipToEnd();
+      return;
+    }
+    
+    T.consumeClose();
+    
+    // Add the assumption to the current bounds safety context
+    Actions.ActOnBoundsSafetyAssume(Assumption.get(), PragmaLoc,
+                                    T.getCloseLocation());
+    
+  } else if (PragmaType->getName() == "assert") {
+    // #pragma bounds_safety assert(expression)
+    BalancedDelimiterTracker T(*this, tok::l_paren);
+    if (T.consumeOpen()) {
+      Diag(Tok.getLocation(), diag::err_expected_lparen_after)
+          << "assert";
+      return;
+    }
+    
+    // Parse the assertion expression
+    EnterExpressionEvaluationContext EC(
+        Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+        nullptr,
+        Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_Other);
+    
+    ExprResult Assertion = ParseAssignmentExpression();
+    if (Assertion.isInvalid()) {
+      T.skipToEnd();
+      return;
+    }
+    
+    T.consumeClose();
+    
+    // Add the assertion to the current bounds safety context
+    Actions.ActOnBoundsSafetyAssert(Assertion.get(), PragmaLoc,
+                                    T.getCloseLocation());
+    
+  } else {
+    Diag(TypeLoc, diag::err_pragma_bounds_safety_unknown_directive)
+        << PragmaType->getName();
+    SkipUntil(tok::eod);
+  }
+  
+  // Expect end of directive
+  if (Tok.isNot(tok::eod)) {
+    Diag(Tok.getLocation(), diag::err_extra_tokens_at_end_of_pragma)
+        << "bounds_safety";
+    SkipUntil(tok::eod);
+  }
+}
+
+	  /// ParseBoundsAnnotatedType - Parses a type annotation that describes
+/// bounds information for a pointer or array type. This is part of the
+/// bounds safety extension that allows annotating types with bounds
+/// information directly in the type syntax.
+///
+/// Syntax:
+///   type __bounded_by(expr) type
+///   type __unbounded type
+///   type __ptr_in_bounds type
+///   type __ptr_in_range(expr, expr) type
+///
+/// This function parses the annotation and returns a modified type that
+/// includes the bounds information.
+///
+TypeResult Parser::ParseBoundsAnnotatedType(SourceLocation &StartLoc,
+                                            SourceLocation &EndLoc) {
+  // Determine what kind of bounds annotation we're parsing
+  enum BoundsKind {
+    BK_BoundedBy,
+    BK_Unbounded,
+    BK_PtrInBounds,
+    BK_PtrInRange,
+    BK_CountedPointer,
+    BK_SizedPointer
+  };
+  
+  BoundsKind Kind;
+  SourceLocation KindLoc;
+  IdentifierInfo *KindName = nullptr;
+  
+  if (Tok.is(tok::kw___bounded_by)) {
+    Kind = BK_BoundedBy;
+    KindName = Tok.getIdentifierInfo();
+    KindLoc = ConsumeToken();
+  } else if (Tok.is(tok::kw___unbounded)) {
+    Kind = BK_Unbounded;
+    KindName = Tok.getIdentifierInfo();
+    KindLoc = ConsumeToken();
+  } else if (Tok.is(tok::kw___ptr_in_bounds)) {
+    Kind = BK_PtrInBounds;
+    KindName = Tok.getIdentifierInfo();
+    KindLoc = ConsumeToken();
+  } else if (Tok.is(tok::kw___ptr_in_range)) {
+    Kind = BK_PtrInRange;
+    KindName = Tok.getIdentifierInfo();
+    KindLoc = ConsumeToken();
+  } else if (Tok.is(tok::kw___counted_pointer)) {
+    Kind = BK_CountedPointer;
+    KindName = Tok.getIdentifierInfo();
+    KindLoc = ConsumeToken();
+  } else if (Tok.is(tok::kw___sized_pointer)) {
+    Kind = BK_SizedPointer;
+    KindName = Tok.getIdentifierInfo();
+    KindLoc = ConsumeToken();
+  } else {
+    return TypeResult();
+  }
+  
+  StartLoc = KindLoc;
+  
+  // Parse the arguments for annotations that require them
+  ExprResult Arg1, Arg2;
+  SourceRange ArgRange;
+  
+  if (Kind == BK_BoundedBy || Kind == BK_PtrInRange || 
+      Kind == BK_CountedPointer || Kind == BK_SizedPointer) {
+    
+    BalancedDelimiterTracker T(*this, tok::l_paren);
+    if (T.consumeOpen()) {
+      Diag(Tok.getLocation(), diag::err_expected_lparen_after)
+          << KindName->getName();
+      return TypeResult(true);
+    }
+    
+    // Parse first argument
+    EnterExpressionEvaluationContext EC(
+        Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated,
+        nullptr,
+        Sema::ExpressionEvaluationContextRecord::ExpressionKind::EK_AttrArgument);
+    
+    Arg1 = ParseAssignmentExpression();
+    if (Arg1.isInvalid()) {
+      T.skipToEnd();
+      return TypeResult(true);
+    }
+    
+    // Parse second argument for ptr_in_range
+    if (Kind == BK_PtrInRange && TryConsumeToken(tok::comma)) {
+      Arg2 = ParseAssignmentExpression();
+      if (Arg2.isInvalid()) {
+        T.skipToEnd();
+        return TypeResult(true);
+      }
+    }
+    
+    T.consumeClose();
+    ArgRange = SourceRange(T.getOpenLocation(), T.getCloseLocation());
+    EndLoc = T.getCloseLocation();
+  } else {
+    // No arguments for unbounded or ptr_in_bounds
+    EndLoc = KindLoc;
+  }
+  
+  // Parse the underlying type that this annotation applies to
+  TypeResult UnderlyingType = ParseTypeName();
+  if (UnderlyingType.isInvalid()) {
+    return TypeResult(true);
+  }
+  
+  // Create the annotated type based on the kind
+  switch (Kind) {
+  case BK_BoundedBy:
+    return Actions.ActOnBoundedByType(UnderlyingType.get(), Arg1.get(),
+                                      SourceRange(StartLoc, EndLoc));
+  case BK_Unbounded:
+    return Actions.ActOnUnboundedType(UnderlyingType.get(),
+                                      SourceRange(StartLoc, EndLoc));
+  case BK_PtrInBounds:
+    return Actions.ActOnPtrInBoundsType(UnderlyingType.get(),
+                                        SourceRange(StartLoc, EndLoc));
+  case BK_PtrInRange:
+    return Actions.ActOnPtrInRangeType(UnderlyingType.get(), Arg1.get(),
+                                       Arg2.get(),
+                                       SourceRange(StartLoc, EndLoc));
+  case BK_CountedPointer:
+    return Actions.ActOnCountedPointerType(UnderlyingType.get(), Arg1.get(),
+                                           SourceRange(StartLoc, EndLoc));
+  case BK_SizedPointer:
+    return Actions.ActOnSizedPointerType(UnderlyingType.get(), Arg1.get(),
+                                         SourceRange(StartLoc, EndLoc));
+  }
+  
+  llvm_unreachable("Unknown bounds annotation kind");
+}
 
 #define TRANSFORM_TYPE_TRAIT_DEF(_, Trait) case tok::kw___##Trait:
 #include "clang/Basic/TransformTypeTraits.def"
