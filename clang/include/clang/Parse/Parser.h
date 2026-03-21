@@ -1,8 +1,19 @@
 //===--- Parser.h - C Language Parser ---------------------------*- C++ -*-===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//   Copyright (C) 2026 Pedro Emanuel
+//
+//    This program is free software: you can redistribute it and/or modify
+//    it under the terms of the GNU Affero General Public License as
+//    published by the Free Software Foundation, either version 3 of the
+//    License, or (at your option) any later version.
+//
+//    This program is distributed in the hope that it will be useful,
+//    but WITHOUT ANY WARRANTY; without even the implied warranty of
+//    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//    GNU Affero General Public License for more details.
+//
+//    You should have received a copy of the GNU Affero General Public License
+//    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
 //===----------------------------------------------------------------------===//
 //
@@ -8978,6 +8989,16 @@ private:
   TPResult TryParseDeclarator(bool mayBeAbstract, bool mayHaveIdentifier = true,
                               bool mayHaveDirectInit = false,
                               bool mayHaveTrailingReturnType = false);
+
+void ParseBoundsSafetyAttributes(ParsedAttributes &Attrs, SourceLocation *EndLoc,
+                                 bool IsParameter, Declarator *D = nullptr);
+void ParseBoundsSafetySpecifier(DeclSpec &DS, SourceLocation &BoundsLoc,
+                                ParsedType &BoundsType, ExprResult &BoundsExpr);
+void ValidateBoundsSafetyDeclarator(Declarator &D, const ParsedAttributes &Attrs,
+                                    SourceLocation DeclLoc);
+void ParsePragmaBoundsSafety();
+TypeResult ParseBoundsAnnotatedType(SourceLocation &StartLoc,
+                                    SourceLocation &EndLoc);
 
   /// \verbatim
   /// parameter-declaration-clause:
